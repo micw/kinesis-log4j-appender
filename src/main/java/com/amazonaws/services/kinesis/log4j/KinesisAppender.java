@@ -17,7 +17,6 @@ package com.amazonaws.services.kinesis.log4j;
 import java.nio.ByteBuffer;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -28,14 +27,11 @@ import org.apache.log4j.spi.ErrorCode;
 import org.apache.log4j.spi.LoggingEvent;
 
 import com.amazonaws.ClientConfiguration;
-import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
-import com.amazonaws.client.builder.ExecutorFactory;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
 import com.amazonaws.retry.PredefinedRetryPolicies;
 import com.amazonaws.retry.RetryPolicy;
-import com.amazonaws.services.kinesis.AmazonKinesisAsync;
-import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder;
+import com.amazonaws.services.kinesis.AmazonKinesisAsyncClient;
 import com.amazonaws.services.kinesis.log4j.helpers.AsyncPutCallStatsReporter;
 import com.amazonaws.services.kinesis.log4j.helpers.BlockFastProducerPolicy;
 import com.amazonaws.services.kinesis.log4j.helpers.CustomCredentialsProviderChain;
@@ -64,9 +60,8 @@ public class KinesisAppender extends AppenderSkeleton {
   private String streamName;
   private boolean initializationFailed = false;
   private BlockingQueue<Runnable> taskBuffer;
-  private AmazonKinesisAsync kinesisClient;
+  private AmazonKinesisAsyncClient kinesisClient;
   private AsyncPutCallStatsReporter asyncCallHander;
-  private ThreadPoolExecutor threadPoolExecutor;
 
   private void error(String message) {
     error(message, null);
@@ -150,34 +145,24 @@ public class KinesisAppender extends AppenderSkeleton {
     clientConfiguration.setMaxErrorRetry(maxRetries);
     clientConfiguration.setRetryPolicy(new RetryPolicy(PredefinedRetryPolicies.DEFAULT_RETRY_CONDITION,
         PredefinedRetryPolicies.DEFAULT_BACKOFF_STRATEGY, maxRetries, true));
-    clientConfiguration.setUserAgentPrefix(AppenderConstants.USER_AGENT_STRING);
+    clientConfiguration.setUserAgent(AppenderConstants.USER_AGENT_STRING);
 
     BlockingQueue<Runnable> taskBuffer = new LinkedBlockingDeque<Runnable>(bufferSize);
-    threadPoolExecutor = new ThreadPoolExecutor(threadCount, threadCount,
+    ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(threadCount, threadCount,
         AppenderConstants.DEFAULT_THREAD_KEEP_ALIVE_SEC, TimeUnit.SECONDS, taskBuffer, new BlockFastProducerPolicy());
     threadPoolExecutor.prestartAllCoreThreads();
-    
-    AmazonKinesisAsyncClientBuilder kinesisClientBuilder=AmazonKinesisAsyncClientBuilder.standard();
-    kinesisClientBuilder.withCredentials(new CustomCredentialsProviderChain());
-    kinesisClientBuilder.withClientConfiguration(clientConfiguration);
-    kinesisClientBuilder.withExecutorFactory(new ExecutorFactory() {
-        
-        @Override
-        public ExecutorService newExecutor() {
-            return threadPoolExecutor;
-        }
-    });
-    
+    kinesisClient = new AmazonKinesisAsyncClient(new CustomCredentialsProviderChain(), clientConfiguration,
+        threadPoolExecutor);
+
     boolean regionProvided = !Validator.isBlank(region);
     if (!regionProvided) {
-        Region detectedRegion = Regions.getCurrentRegion();
-        if (detectedRegion!=null) {
-            region = detectedRegion.getName();
-        } else {
-            region = AppenderConstants.DEFAULT_REGION;
-        }
+      Region detectedRegion = Regions.getCurrentRegion();
+      if (detectedRegion!=null) {
+          region = detectedRegion.getName();
+      } else {
+        region = AppenderConstants.DEFAULT_REGION;
+      }
     }
-    
     if (!Validator.isBlank(endpoint)) {
       if (regionProvided) {
 	LOGGER
@@ -186,14 +171,12 @@ public class KinesisAppender extends AppenderSkeleton {
 		+ ") will be used as endpoint instead of default endpoint for region ("
 		+ region + ")");
       }
-      
-      kinesisClientBuilder.setEndpointConfiguration(new EndpointConfiguration(endpoint, region));
+      kinesisClient.setEndpoint(endpoint,
+	  AppenderConstants.DEFAULT_SERVICE_NAME, region);
     } else {
-        kinesisClientBuilder.setRegion(region);
+      kinesisClient.setRegion(Region.getRegion(Regions.fromName(region)));
     }
 
-    kinesisClient = kinesisClientBuilder.build();
-    
     DescribeStreamResult describeResult = null;
     try {
       describeResult = kinesisClient.describeStream(streamName);
@@ -218,12 +201,13 @@ public class KinesisAppender extends AppenderSkeleton {
    */
   @Override
   public void close() {
-    threadPoolExecutor.shutdown();
-    BlockingQueue<Runnable> taskQueue = threadPoolExecutor.getQueue();
-    int bufferSizeBeforeShutdown = threadPoolExecutor.getQueue().size();
+    ThreadPoolExecutor threadpool = (ThreadPoolExecutor) kinesisClient.getExecutorService();
+    threadpool.shutdown();
+    BlockingQueue<Runnable> taskQueue = threadpool.getQueue();
+    int bufferSizeBeforeShutdown = threadpool.getQueue().size();
     boolean gracefulShutdown = true;
     try {
-      gracefulShutdown = threadPoolExecutor.awaitTermination(shutdownTimeout, TimeUnit.SECONDS);
+      gracefulShutdown = threadpool.awaitTermination(shutdownTimeout, TimeUnit.SECONDS);
     } catch (InterruptedException e) {
       // we are anyways cleaning up
     } finally {
